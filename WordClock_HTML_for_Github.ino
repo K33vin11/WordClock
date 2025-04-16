@@ -5,26 +5,21 @@
 #include <TimeLib.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+#include <time.h>
 
-
-
-//WiFi credentials
+// WiFi credentials
 const char* ssid = "WLAN";
-const char* password = "Passwort";
+const char* password = "Password";
 
 // Set your Static IP address
 IPAddress local_IP(192, 168, 1, 200);
-
 // Set your Gateway IP address
 IPAddress gateway(192, 168, 1, 1);
 IPAddress subnet(255, 255, 255, 0);
 IPAddress dns(8, 8, 8, 8);
 
-
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "ch.pool.ntp.org", 3600);
-
-
+NTPClient timeClient(ntpUDP, "ch.pool.ntp.org", 3600, 60000);
 
 // Neopixel setup
 #define LED_PIN D2
@@ -42,15 +37,11 @@ NTPClient timeClient(ntpUDP, "ch.pool.ntp.org", 3600);
 #define TimeOnMinute_ADRESS 7
 #define TimeOffHour_ADRESS 8
 #define TimeOffMinute_ADRESS 9
-
+#define summerTime_ADRESS 10
 
 int mode = 0;
-int up = 0;
-int down = 0;
-int left = 0;
-int right = 0;
 int oldminutes = 100;
-int timetostay = 10; // in sekunden
+int timetostay = 10; // in Sekunden
 
 int redValueTime;
 int greenValueTime;
@@ -62,16 +53,53 @@ int TimeOnHour = 6;
 int TimeOnMinute = 0;
 int TimeOffHour = 22;
 int TimeOffMinute = 0;
+int summerTime = 0;
 int red, green, blue;
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-uint32_t textColor = strip.Color(redValueTime, greenValueTime, blueValueTime);
-uint32_t specialColor = strip.Color(redValueSpecial, greenValueSpecial, blueValueSpecial);
+uint32_t textColor;
+uint32_t specialColor;
 
 int hoursValue = 0;
 
 ESP8266WebServer server(80);
+
+// Funktion zur Berechnung der Sommerzeit in der Schweiz
+bool isSummerTime(int year, int month, int day, int hour) {
+  struct tm timeinfo;
+  timeinfo.tm_year = year - 1900; // Jahr seit 1900
+  timeinfo.tm_mon = month - 1;     // Monat 0-11
+  timeinfo.tm_mday = day;
+  timeinfo.tm_hour = hour;
+  timeinfo.tm_min = 0;
+  timeinfo.tm_sec = 0;
+  
+  time_t t = mktime(&timeinfo);
+  struct tm *marchLastSunday = localtime(&t);
+  marchLastSunday->tm_mon = 2; // März
+  marchLastSunday->tm_mday = 31;
+  mktime(marchLastSunday);
+  while (marchLastSunday->tm_wday != 0) { // 0 = Sonntag
+    marchLastSunday->tm_mday--;
+    mktime(marchLastSunday);
+  }
+  time_t marchEnd = mktime(marchLastSunday) + 2 * 3600; // 02:00 Uhr
+  
+  struct tm *octLastSunday = localtime(&t);
+  octLastSunday->tm_mon = 9; // Oktober
+  octLastSunday->tm_mday = 31;
+  mktime(octLastSunday);
+  while (octLastSunday->tm_wday != 0) { // 0 = Sonntag
+    octLastSunday->tm_mday--;
+    mktime(octLastSunday);
+  }
+  time_t octEnd = mktime(octLastSunday) + 3 * 3600; // 03:00 Uhr
+  
+  time_t now = mktime(&timeinfo);
+  
+  return (now >= marchEnd && now < octEnd);
+}
 
 void setup() {
   WiFi.hostname("Wordclock");
@@ -84,10 +112,7 @@ void setup() {
 
   strip.begin();
   strip.show();
-  textColor = strip.Color(redValueTime, greenValueTime, blueValueTime);
-  specialColor = strip.Color(redValueSpecial, greenValueSpecial, blueValueSpecial);
-
-
+  updateColors(); // Farben initialisieren
 
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
@@ -95,7 +120,6 @@ void setup() {
     delay(500);
   }
   setupWebServer();
-  loadColorsFromEEPROM();
 
   Serial.print("Server IP address: ");
   Serial.println(WiFi.localIP());
@@ -104,7 +128,7 @@ void setup() {
   delay(800);
 
   timeClient.begin();
-  timeClient.setTimeOffset(3600);
+  timeClient.setTimeOffset(3600); // Initiales Offset, wird im loop aktualisiert
 
   oldminutes = 100;
   displayTime(timeClient.getHours(), timeClient.getMinutes(), timeClient.getEpochTime());
@@ -113,6 +137,18 @@ void setup() {
 void loop() {
   server.handleClient();
   timeClient.update();
+  
+  time_t rawtime = timeClient.getEpochTime();
+  struct tm *ti = localtime(&rawtime);
+  int year = ti->tm_year + 1900;
+  int month = ti->tm_mon + 1;
+  int day = ti->tm_mday;
+  int hour = ti->tm_hour;
+
+  // Sommerzeit automatisch berechnen
+  summerTime = isSummerTime(year, month, day, hour) ? 1 : 0;
+  timeClient.setTimeOffset(summerTime ? 7200 : 3600); // UTC+2 für Sommerzeit, UTC+1 für Winterzeit
+
   displayTime(timeClient.getHours(), timeClient.getMinutes(), timeClient.getEpochTime());
   delay(100);
 }
@@ -128,6 +164,7 @@ void loadColorsFromEEPROM() {
   TimeOnMinute = EEPROM.read(TimeOnMinute_ADRESS);
   TimeOffHour = EEPROM.read(TimeOffHour_ADRESS);
   TimeOffMinute = EEPROM.read(TimeOffMinute_ADRESS);
+  summerTime = EEPROM.read(summerTime_ADRESS);
   
   Serial.println("EEPROM gelesen");
 }
@@ -143,22 +180,27 @@ void saveColorsToEEPROM() {
   EEPROM.write(TimeOnMinute_ADRESS, TimeOnMinute);
   EEPROM.write(TimeOffHour_ADRESS, TimeOffHour);
   EEPROM.write(TimeOffMinute_ADRESS, TimeOffMinute);
-
+  EEPROM.write(summerTime_ADRESS, summerTime);
   EEPROM.commit();
   Serial.println("EEPROM gespeichert");
   delay(1000);
 }
 
+void updateColors() {
+  // Farben direkt ohne Helligkeitsskalierung setzen
+  textColor = strip.Color(redValueTime, greenValueTime, blueValueTime);
+  specialColor = strip.Color(redValueSpecial, greenValueSpecial, blueValueSpecial);
+}
+
 void displayTime(int hours, int minutes, unsigned long epochTime) {
-  struct tm* ti;
   time_t rawtime = epochTime;
-  ti = localtime(&rawtime);
+  struct tm *ti = localtime(&rawtime);
+
   int year = ti->tm_year + 1900;
   int month = ti->tm_mon + 1;
   int day = ti->tm_mday;
-
-  int aniYears = year - 2019;
-  hours = hours;
+  int hour = ti->tm_hour;
+  int minute = ti->tm_min;
 
   Serial.print("Datum: ");
   Serial.print(day);
@@ -195,13 +237,14 @@ void displayTime(int hours, int minutes, unsigned long epochTime) {
   Serial.print(":");
   Serial.println(TimeOffMinute);
 
+  Serial.print("SummerTime: ");
+  Serial.println(summerTime);
 
+  if (minutes != oldminutes) {
+    if ((hours > TimeOnHour || (hours == TimeOnHour && minutes >= TimeOnMinute)) &&
+        (hours < TimeOffHour || (hours == TimeOffHour && minutes <= TimeOffMinute))) {
 
-   if (minutes != oldminutes) {
-   if ((hours > TimeOnHour || (hours == TimeOnHour && minutes >= TimeOnMinute)) &&
-      (hours < TimeOffHour || (hours == TimeOffHour && minutes <= TimeOffMinute))) {
-
-       Serial.println("TimeToShine");
+      Serial.println("TimeToShine");
 
       clearWords();
 
@@ -298,51 +341,48 @@ void displayTime(int hours, int minutes, unsigned long epochTime) {
       }
 
       if ((day == 5) & (month == 7)) {
-        Serial.println("Happy Birtday Livia");
+        Serial.println("Happy Birthday Livia");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("BIRTHDAY", specialColor);
         lightUpWord("LIVIA", specialColor);
       }
 
       if ((day == 26) & (month == 11)) {
-        Serial.println("Happy Birtday Kevin");
+        Serial.println("Happy Birthday Kevin");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("BIRTHDAY", specialColor);
-        lightUpWord("Kevin", specialColor);
+        lightUpWord("KEVIN", specialColor);
       }
 
-        if ((day == 26) & (month == 3)) {
-        Serial.println("Happy Birtday Tiziano");
-        lightUpWord("HAPPY", specialColor);
-        lightUpWord("BIRTHDAY", specialColor);
-      }
-
-         if ((day == 14) & (month == 9)) {
-        Serial.println("Happy Birtday Andrea");
+      if ((day == 26) & (month == 3)) {
+        Serial.println("Happy Birthday Tiziano");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("BIRTHDAY", specialColor);
       }
 
-               if ((day == 25) & (month == 3)) {
-        Serial.println("Happy Birtday Alessia");
+      if ((day == 14) & (month == 9)) {
+        Serial.println("Happy Birthday Andrea");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("BIRTHDAY", specialColor);
       }
 
-      
-        if ((day == 29) & (month == 11)) {
-        Serial.println("Happy Birtday Leo");
+      if ((day == 25) & (month == 3)) {
+        Serial.println("Happy Birthday Alessia");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("BIRTHDAY", specialColor);
       }
 
-        if ((day == 9) & (month == 2)) {
-        Serial.println("Happy Birtday Shady");
+      if ((day == 29) & (month == 11)) {
+        Serial.println("Happy Birthday Leo");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("BIRTHDAY", specialColor);
       }
 
-
+      if ((day == 9) & (month == 2)) {
+        Serial.println("Happy Birthday Shady");
+        lightUpWord("HAPPY", specialColor);
+        lightUpWord("BIRTHDAY", specialColor);
+      }
 
       if ((day == 3) & (month == 6)) {
         delay(timetostay * 1000);
@@ -350,28 +390,28 @@ void displayTime(int hours, int minutes, unsigned long epochTime) {
         Serial.println("Anniversary");
         lightUpWord("HAPPY", specialColor);
         lightUpWord("YEARS", specialColor);
-        if (aniYears == 5) {
+        if (year - 2018 == 5) {
           lightUpWord("FÜF", specialColor);
         }
-        if (aniYears == 6) {
+        if (year - 2018 == 6) {
           lightUpWord("SÄCHS", specialColor);
         }
-        if (aniYears == 7) {
+        if (year - 2018 == 7) {
           lightUpWord("SIBE", specialColor);
         }
-        if (aniYears == 8) {
+        if (year - 2018 == 8) {
           lightUpWord("ACHT", specialColor);
         }
-        if (aniYears == 9) {
+        if (year - 2018 == 9) {
           lightUpWord("NÜN", specialColor);
         }
-        if (aniYears == 10) {
+        if (year - 2018 == 10) {
           lightUpWord("ZÄH", specialColor);
         }
-        if (aniYears == 11) {
+        if (year - 2018 == 11) {
           lightUpWord("ÖUF", specialColor);
         }
-        if (aniYears == 12) {
+        if (year - 2018 == 12) {
           lightUpWord("ZWÖUF", specialColor);
         }
         delay(timetostay * 1000);
@@ -458,222 +498,189 @@ void clearWords() {
 
 void handleRoot() {
   mode = 0;
+  String summerTimeChecked = (summerTime == 1) ? "checked" : "";
+  // Formatierung der Zeitwerte mit führenden Nullen
+  String startTimeValue = (TimeOnHour < 10 ? "0" : "") + String(TimeOnHour) + ":" + (TimeOnMinute < 10 ? "0" : "") + String(TimeOnMinute);
+  String endTimeValue = (TimeOffHour < 10 ? "0" : "") + String(TimeOffHour) + ":" + (TimeOffMinute < 10 ? "0" : "") + String(TimeOffMinute);
   String html = R"rawliteral(
 <!DOCTYPE html>
-<html lang='en'>
+<html lang="en">
 <head>
-  <meta charset='UTF-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WordClock</title>
   <style>
-    .color-circle {
-      position: relative;
-      width: 300px;
-      height: 300px;
-      border-radius: 50%;
-      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-      background: radial-gradient(circle, transparent 40%, black 150%), radial-gradient(circle closest-side, white 1%, transparent 50%), conic-gradient(purple, magenta, red, orange, yellow, lime, aqua, blue, purple);
-      cursor: crosshair;
-    }
-    .color-indicator {
-      position: absolute;
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      border: 2px solid white;
-      background-color: white;
-      pointer-events: none;
-    }
-    .color-display-container {
+    body {
+      font-family: 'Arial', sans-serif;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      margin: 0;
+      padding: 20px;
       display: flex;
+      justify-content: center;
       align-items: center;
-      margin-top: 20px;
+      min-height: 100vh;
+      color: #fff;
     }
-    .color-display {
-      width: 100px;
-      height: 100px;
-      border: 2px solid #000;
+    .container {
+      background: rgba(255, 255, 255, 0.95);
+      padding: 30px;
+      border-radius: 15px;
+      box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
+      width: 100%;
+      max-width: 450px;
+      color: #333;
     }
-    .slider {
-      margin-left: 20px;
+    h2 {
+      text-align: center;
+      color: #764ba2;
+      margin-bottom: 25px;
+      font-size: 28px;
+      text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.1);
     }
-    .button-container {
-      margin-top: 20px;
+    .section {
+      margin-bottom: 25px;
+      padding: 15px;
+      background: #f9f9f9;
+      border-radius: 10px;
+      box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.05);
     }
-    .time-container {
-      margin-top: 20px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+    label {
+      display: block;
+      margin: 10px 0 5px;
+      color: #555;
+      font-weight: 600;
+      font-size: 14px;
     }
-    .time-input {
+    input[type="color"] {
+      width: 100%;
+      height: 40px;
+      padding: 0;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin-bottom: 10px;
+    }
+    input[type="time"] {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      box-sizing: border-box;
+      font-size: 14px;
+    }
+    input[type="checkbox"] {
+      margin-left: 10px;
+      vertical-align: middle;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      margin: 5px 0;
+      background: linear-gradient(to right, #667eea, #764ba2);
+      color: white;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: bold;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    }
+    .color-picker {
       display: flex;
       flex-direction: column;
       align-items: center;
     }
-    input[type='time'] {
-      width: 150px;
+    .info {
+      font-size: 12px;
+      color: #777;
+      margin-top: 5px;
     }
   </style>
 </head>
 <body>
-  <h1>WordClock</h1>
-  <div class='color-circle' id='colorCircle'>
-    <div class='color-indicator' id='colorIndicator'></div>
-  </div>
-  <div class='color-display-container'>
-    <div class='color-display' id='colorDisplay'></div>
-    <input type='range' min='0' max='100' value='50' class='slider' id='colorSlider'>
-  </div>
-  <div class='button-container'>
-    <button id='timeColor'>TimeColor</button>
-    <button id='specialColor'>SpecialColor</button>
-  </div>
-  <div class='time-container'>
-    <div class="time-input">
-      <label for='startTime'>On Time:</label>
-      <input type='time' id='startTime' name='startTime'>
+  <div class="container">
+    <h2>WordClock Steuerung</h2>
+    <div class="section">
+      <label>Zeitfarbe:</label>
+      <div class="color-picker">
+        <input type="color" id="timeColor" value="#ffffff">
+        <button onclick="setTimeColor()">Set Time Color</button>
+      </div>
     </div>
-    <div class="time-input">
-      <label for='endTime'>Off Time:</label>
-      <input type='time' id='endTime' name='endTime'>
+    <div class="section">
+      <label>Sonderfarbe:</label>
+      <div class="color-picker">
+        <input type="color" id="specialColor" value="#ffffff">
+        <button onclick="setSpecialColor()">Set Special Color</button>
+      </div>
+    </div>
+    <div class="section">
+      <label>Einschaltzeit:</label>
+      <input type="time" id="startTime" value=")rawliteral" + startTimeValue + R"rawliteral(">
+      <label>Ausschaltzeit:</label>
+      <input type="time" id="endTime" value=")rawliteral" + endTimeValue + R"rawliteral(">
+      <label>Sommerzeit: <input type="checkbox" id="summerTime" disabled )rawliteral" + summerTimeChecked + R"rawliteral(></label>
+      <div class="info">Sommerzeit wird automatisch basierend auf dem Datum berechnet.</div>
+      <button onclick="setTime()">Set Time</button>
     </div>
   </div>
-  <div class='button-container'>
-    <button id='applyButton'>Apply</button>
-  </div>
-  <form id="colorForm" style="display:none;">
-    <input type="text" id="red" name="red">
-    <input type="text" id="green" name="green">
-    <input type="text" id="blue" name="blue">
-    <input type="text" id="startTimeValue" name="startTimeValue">
-    <input type="text" id="endTimeValue" name="endTimeValue">
-  </form>
   <script>
-    const colorCircle = document.getElementById('colorCircle');
-    const colorIndicator = document.getElementById('colorIndicator');
-    const colorDisplay = document.getElementById('colorDisplay');
-    const colorSlider = document.getElementById('colorSlider');
-    const timeColorButton = document.getElementById('timeColor');
-    const specialColorButton = document.getElementById('specialColor');
-    const applyButton = document.getElementById('applyButton');
+    function hexToRgb(hex) {
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      return { r, g, b };
+    }
 
-    let currentColor = 'hsl(0, 100%, 50%)';
-    let hue = 0, saturation = 100, lightness = 50;
-    let colorMode = '';
-
-    colorCircle.addEventListener('mousemove', function(event) {
-      const rect = colorCircle.getBoundingClientRect();
-      const centerX = rect.left + rect.width / 2;
-      const centerY = rect.top + rect.height / 2;
-      const x = event.clientX - centerX;
-      const y = event.clientY - centerY;
-      const angle = Math.atan2(y, x);
-      hue = angle >= 0 ? angle * 180 / Math.PI : (2 * Math.PI + angle) * 180 / Math.PI;
-      const distance = Math.sqrt(x * x + y * y);
-      const maxRadius = rect.width / 2;
-      lightness = 100 - (distance / maxRadius) * 50;
-      currentColor = `hsl(${Math.round(hue)}, ${saturation}%, ${Math.round(lightness)}%)`;
-      colorIndicator.style.left = `${event.clientX - rect.left}px`;
-      colorIndicator.style.top = `${event.clientY - rect.top}px`;
-      colorIndicator.style.backgroundColor = currentColor;
-    });
-
-    colorCircle.addEventListener('click', function() {
-      colorDisplay.style.backgroundColor = currentColor;
-    });
-
-    colorSlider.addEventListener('input', function() {
-      lightness = colorSlider.value;
-      currentColor = `hsl(${Math.round(hue)}, ${saturation}%, ${Math.round(lightness)}%)`;
-      colorDisplay.style.backgroundColor = currentColor;
-      colorIndicator.style.backgroundColor = currentColor;
-    });
-
-    timeColorButton.addEventListener('click', function() {
-      colorMode = 'timecolor';
-      submitColor('/timecolor');
-    });
-
-    specialColorButton.addEventListener('click', function() {
-      colorMode = 'specialcolor';
-      submitColor('/specialcolor');
-    });
-
-    applyButton.addEventListener('click', function() {
-      if (colorMode) {
-        submitColor(colorMode === 'timecolor' ? '/timecolor' : '/specialcolor');
-      } else {
-        submitColor('/apply');
-      }
-    });
-
-    function submitColor(endpoint) {
-      const [h, s, l] = currentColor.match(/\d+/g).map(Number);
-      const [r, g, b] = hslToRgb(h, s, l);
-
-      document.getElementById('red').value = r;
-      document.getElementById('green').value = g;
-      document.getElementById('blue').value = b;
-      document.getElementById('startTimeValue').value = document.getElementById('startTime').value;
-      document.getElementById('endTimeValue').value = document.getElementById('endTime').value;
-
-      const formData = new FormData(document.getElementById('colorForm'));
-
-      fetch(endpoint, {
+    function setTimeColor() {
+      const { r, g, b } = hexToRgb(document.getElementById('timeColor').value);
+      fetch('/timecolor', {
         method: 'POST',
-        body: new URLSearchParams(formData)
-      })
-      .then(response => {
-        if (response.ok) {
-          window.location.href = '/';
-        } else {
-          alert('Error submitting values');
-        }
-      })
-      .catch(error => {
-        alert('Error submitting values');
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `red=${r}&green=${g}&blue=${b}`
+      }).then(response => {
+        alert('Done');
+        window.location.href = '/';
       });
     }
 
-    function hslToRgb(h, s, l) {
-      h /= 360;
-      s /= 100;
-      l /= 100;
-      let r, g, b;
+    function setSpecialColor() {
+      const { r, g, b } = hexToRgb(document.getElementById('specialColor').value);
+      fetch('/specialcolor', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `red=${r}&green=${g}&blue=${b}`
+      }).then(response => {
+        alert('Done');
+        window.location.href = '/';
+      });
+    }
 
-      if (s === 0) {
-        r = g = b = l;
-      } else {
-        const hue2rgb = (p, q, t) => {
-          if (t < 0) t += 1;
-          if (t > 1) t -= 1;
-          if (t < 1 / 6) return p + (q - p) * 6 * t;
-          if (t < 1 / 2) return q;
-          if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-          return p;
-        };
-        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-        const p = 2 * l - q;
-        r = hue2rgb(p, q, h + 1 / 3);
-        g = hue2rgb(p, q, h);
-        b = hue2rgb(p, q, h - 1 / 3);
-      }
-
-      return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+    function setTime() {
+      const start = document.getElementById('startTime').value;
+      const end = document.getElementById('endTime').value;
+      const timeRgb = hexToRgb(document.getElementById('timeColor').value);
+      const specialRgb = hexToRgb(document.getElementById('specialColor').value);
+      fetch('/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `startTime=${start}&endTime=${end}&redTime=${timeRgb.r}&greenTime=${timeRgb.g}&blueTime=${timeRgb.b}&redSpecial=${specialRgb.r}&greenSpecial=${specialRgb.g}&blueSpecial=${specialRgb.b}`
+      }).then(response => {
+        alert('Done');
+        window.location.href = '/';
+      });
     }
   </script>
 </body>
 </html>
-  )rawliteral";
+)rawliteral";
   server.send(200, "text/html", html);
 }
-
-
-
-
-
-
 
 void handleTimeColor() {
   if (server.hasArg("red") && server.hasArg("green") && server.hasArg("blue")) {
@@ -681,24 +688,29 @@ void handleTimeColor() {
     greenValueTime = server.arg("green").toInt();
     blueValueTime = server.arg("blue").toInt();
 
-    Serial.printf("TimeColor values - red: %d, green: %d, blue: %d\n", redValueTime, greenValueTime, blueValueTime);
-    textColor = strip.Color(redValueTime, greenValueTime, blueValueTime);
+    updateColors();
+    
+    Serial.printf("TimeColor values - red: %d, green: %d, blue: %d\n", 
+      redValueTime, greenValueTime, blueValueTime);
+    
     saveColorsToEEPROM();
-    oldminutes = 100;
+    oldminutes = 100; // Erzwinge ein Update der Anzeige
     server.sendHeader("Location", "/", true);
-    server.send(303, "text/plain", "Redirecting to home");
+    server.send(303, "text/plain", "Done");
   } else {
-  redValueTime = EEPROM.read(RED_VALUE_TIME_ADDRESS);
-  greenValueTime = EEPROM.read(GREEN_VALUE_TIME_ADDRESS);
-  blueValueTime = EEPROM.read(BLUE_VALUE_TIME_ADDRESS);
+    redValueTime = EEPROM.read(RED_VALUE_TIME_ADDRESS);
+    greenValueTime = EEPROM.read(GREEN_VALUE_TIME_ADDRESS);
+    blueValueTime = EEPROM.read(BLUE_VALUE_TIME_ADDRESS);
 
-    Serial.printf("TimeColor values - red: %d, green: %d, blue: %d\n", redValueTime, greenValueTime, blueValueTime);
-    textColor = strip.Color(redValueTime, greenValueTime, blueValueTime);
+    updateColors();
+
+    Serial.printf("TimeColor values - red: %d, green: %d, blue: %d\n", 
+      redValueTime, greenValueTime, blueValueTime);
+    
     saveColorsToEEPROM();
     oldminutes = 100;
     server.sendHeader("Location", "/", true);
-    server.send(303, "text/plain", "Redirecting to home");
-
+    server.send(303, "text/plain", "Done");
   }
 }
 
@@ -708,37 +720,39 @@ void handleSpecialColor() {
     greenValueSpecial = server.arg("green").toInt();
     blueValueSpecial = server.arg("blue").toInt();
 
-    Serial.printf("SpecialColor values - red: %d, green: %d, blue: %d\n", redValueSpecial, greenValueSpecial, blueValueSpecial);
-    specialColor = strip.Color(redValueSpecial, greenValueSpecial, blueValueSpecial);
+    updateColors();
+    
+    Serial.printf("SpecialColor values - red: %d, green: %d, blue: %d\n", 
+      redValueSpecial, greenValueSpecial, blueValueSpecial);
+    
     saveColorsToEEPROM();
     oldminutes = 100;
     server.sendHeader("Location", "/", true);
-    server.send(303, "text/plain", "Redirecting to home");
+    server.send(303, "text/plain", "Done");
   } else {
-  redValueSpecial = EEPROM.read(RED_VALUE_SPECIAL_ADDRESS);
-  greenValueSpecial = EEPROM.read(GREEN_VALUE_SPECIAL_ADDRESS);
-  blueValueSpecial = EEPROM.read(BLUE_VALUE_SPECIAL_ADDRESS);
+    redValueSpecial = EEPROM.read(RED_VALUE_SPECIAL_ADDRESS);
+    greenValueSpecial = EEPROM.read(GREEN_VALUE_SPECIAL_ADDRESS);
+    blueValueSpecial = EEPROM.read(BLUE_VALUE_SPECIAL_ADDRESS);
 
-    Serial.printf("SpecialColor values - red: %d, green: %d, blue: %d\n", redValueSpecial, greenValueSpecial, blueValueSpecial);
-    specialColor = strip.Color(redValueSpecial, greenValueSpecial, blueValueSpecial);
+    updateColors();
+
+    Serial.printf("SpecialColor values - red: %d, green: %d, blue: %d\n", 
+      redValueSpecial, greenValueSpecial, blueValueSpecial);
+    
     saveColorsToEEPROM();
     oldminutes = 100;
     server.sendHeader("Location", "/", true);
-    server.send(303, "text/plain", "Redirecting to home");
-
-
-
+    server.send(303, "text/plain", "Done");
   }
 }
 
 void handleApply() {
-  if (server.hasArg("startTimeValue") && server.hasArg("endTimeValue")) {
+  if (server.hasArg("startTime") && server.hasArg("endTime")) {
     Serial.println("apply");
 
-    String startTimeStr = server.arg("startTimeValue");
-    String endTimeStr = server.arg("endTimeValue");
-
-
+    String startTimeStr = server.arg("startTime");
+    String endTimeStr = server.arg("endTime");
+    
     int startTimeHour = startTimeStr.substring(0, 2).toInt();
     int startTimeMinute = startTimeStr.substring(3).toInt();
     int endTimeHour = endTimeStr.substring(0, 2).toInt();
@@ -749,18 +763,31 @@ void handleApply() {
     TimeOffHour = endTimeHour;
     TimeOffMinute = endTimeMinute;
 
+    if (server.hasArg("redTime") && server.hasArg("greenTime") && server.hasArg("blueTime")) {
+      redValueTime = server.arg("redTime").toInt();
+      greenValueTime = server.arg("greenTime").toInt();
+      blueValueTime = server.arg("blueTime").toInt();
+    }
 
-    Serial.printf("Time values - TimeOnHour: %d, TimeOnMinute: %d, TimeOffHour: %d, TimeOffMinute: %d\n", TimeOnHour, TimeOnMinute, TimeOffHour, TimeOffMinute);
+    if (server.hasArg("redSpecial") && server.hasArg("greenSpecial") && server.hasArg("blueSpecial")) {
+      redValueSpecial = server.arg("redSpecial").toInt();
+      greenValueSpecial = server.arg("greenSpecial").toInt();
+      blueValueSpecial = server.arg("blueSpecial").toInt();
+    }
+
+    updateColors();
+
+    Serial.printf("Time values - TimeOnHour: %d, TimeOnMinute: %d, TimeOffHour: %d, TimeOffMinute: %d\n", 
+      TimeOnHour, TimeOnMinute, TimeOffHour, TimeOffMinute);
+    
     saveColorsToEEPROM();
     oldminutes = 100;
     server.sendHeader("Location", "/", true);
-    server.send(303, "text/plain", "Redirecting to home");
+    server.send(303, "text/plain", "Done");
   } else {
     server.send(400, "text/plain", "Missing values");
   }
 }
-
-
 
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
